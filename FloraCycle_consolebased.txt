@@ -1,0 +1,569 @@
+package com.floracycle;
+
+import com.floracycle.model.*;
+import com.floracycle.persistence.FileRepository;
+import com.floracycle.payment.*;
+import com.floracycle.service.*;
+
+import java.util.*;
+import java.util.concurrent.*;
+
+public class FloraCycleApp {
+    private static final Scanner scanner = new Scanner(System.in);
+    public static void main(String[] args) {
+        System.out.println("=== Welcome to FloraCycle ===");
+
+        String dataDir = "data";
+        FileRepository<User> userRepo = new FileRepository<>(dataDir + "/users.ser");
+        FileRepository<Product> productRepo = new FileRepository<>(dataDir + "/products.ser");
+        FileRepository<Order> orderRepo = new FileRepository<>(dataDir + "/orders.ser");
+        FileRepository<PickupRequest> pickupRepo = new FileRepository<>(dataDir + "/pickups.ser");
+
+        seedData(userRepo, productRepo);
+
+        AuthService auth = new AuthService(userRepo);
+        CatalogService catalog = new CatalogService(productRepo);
+        OrderService orderSvc = new OrderService(orderRepo, productRepo);
+        RecyclingService recyclingSvc = new RecyclingService(pickupRepo, productRepo, orderSvc);
+        DeliveryService deliverySvc = new DeliveryService(orderSvc);
+
+        ExecutorService executor = Executors.newCachedThreadPool();
+
+        mainLoop(auth, catalog, orderSvc, recyclingSvc, deliverySvc, executor);
+
+        executor.shutdownNow();
+        System.out.println("Exiting FloraCycle. Bye!");
+    }
+
+    private static void mainLoop(AuthService auth, CatalogService catalog, OrderService orderSvc,
+                                 RecyclingService recyclingSvc, DeliveryService deliverySvc,
+                                 ExecutorService executor) {
+        while (true) {
+            try {
+                System.out.println("\n1) Register 2) Login 3) Exit");
+                System.out.print("Choose: ");
+                String opt = scanner.nextLine().trim();
+                if ("1".equals(opt)) {
+                    System.out.print("Name: "); String name = scanner.nextLine().trim();
+                    System.out.print("Email: "); String email = scanner.nextLine().trim();
+                    System.out.print("Password: "); String pwd = scanner.nextLine().trim();
+                    User u = auth.register(name, email, pwd, Role.CUSTOMER);
+                    System.out.println("Registered: " + u.getName());
+                } else if ("2".equals(opt)) {
+                    System.out.print("Email: "); String email = scanner.nextLine().trim();
+                    System.out.print("Password: "); String pwd = scanner.nextLine().trim();
+                    User u = auth.login(email, pwd);
+                    System.out.println("Welcome, " + u.getName() + " (" + u.getRole() + ")");
+                    if (u.getRole() == Role.ADMIN) adminLoop(catalog, productRepoSafe(catalog));
+                    else customerLoop((Customer)u, catalog, orderSvc, recyclingSvc, deliverySvc, executor);
+                } else if ("3".equals(opt)) break;
+                else System.out.println("Invalid.");
+            } catch (Exception ex) {
+                System.out.println("Error: " + ex.getMessage());
+            }
+        }
+    }
+
+    // helper to access repository from catalog by reflection (small cheat to avoid passing repo everywhere)
+    private static com.floracycle.persistence.FileRepository<Product> productRepoSafe(CatalogService catalog) {
+        try {
+            java.lang.reflect.Field f = CatalogService.class.getDeclaredField("repo");
+            f.setAccessible(true);
+            return (com.floracycle.persistence.FileRepository<Product>) f.get(catalog);
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
+
+    private static void adminLoop(CatalogService catalog, com.floracycle.persistence.FileRepository<Product> repo) {
+        Scanner sc = new Scanner(System.in);
+        while (true) {
+            System.out.println("\nADMIN: 1) List 2) Add Flower 3) Update Stock 4) Back");
+            System.out.print("Choose: ");
+            String s = sc.nextLine().trim();
+            try {
+                if ("1".equals(s)) catalog.listProducts().forEach(System.out::println);
+                else if ("2".equals(s)) {
+                    System.out.print("Name: "); String name = sc.nextLine().trim();
+                    System.out.print("Price: "); double price = Double.parseDouble(sc.nextLine().trim());
+                    System.out.print("Stock: "); int stock = Integer.parseInt(sc.nextLine().trim());
+                    Flower f = new Flower(UUID.randomUUID().toString(), name, "Fresh flowers", price, stock, FlowerType.MIXED);
+                    catalog.addProduct(f);
+                    System.out.println("Added: " + name);
+                } else if ("3".equals(s)) {
+                    System.out.print("Product id: "); String id = sc.nextLine().trim();
+                    System.out.print("New stock: "); int st = Integer.parseInt(sc.nextLine().trim());
+                    catalog.updateStock(id, st);
+                    System.out.println("Updated.");
+                } else if ("4".equals(s)) break;
+                else System.out.println("Invalid.");
+            } catch (Exception ex) { System.out.println("Error: " + ex.getMessage()); }
+        }
+    }
+
+    private static void customerLoop(Customer customer, CatalogService catalog, OrderService orderSvc,
+                                     RecyclingService recyclingSvc, DeliveryService deliverySvc, ExecutorService executor) {
+        Scanner sc = new Scanner(System.in);
+        Cart cart = new Cart();
+
+        while (true) {
+            System.out.println("\nCUSTOMER MENU:\n1) Browse 2) Add to Cart 3) View Cart 4) Checkout\n5) Schedule Pickup 6) My Orders 7) My Pickups 8) Logout");
+            System.out.print("Choose: ");
+            String c = sc.nextLine().trim();
+            try {
+                if ("1".equals(c)) catalog.listProducts().forEach(System.out::println);
+                else if ("2".equals(c)) {
+                    System.out.print("Product id: "); String id = sc.nextLine().trim();
+                    System.out.print("Qty: "); int q = Integer.parseInt(sc.nextLine().trim());
+                    Product p = catalog.getProductById(id);
+                    cart.addItem(p, q);
+                    System.out.println("Added.");
+                } else if ("3".equals(c)) System.out.println(cart);
+                else if ("4".equals(c)) {
+                    if (cart.isEmpty()) { System.out.println("Cart empty."); continue; }
+                    System.out.print("Address: "); String addr = sc.nextLine().trim();
+                    System.out.print("Payment (1) Card (2) UPI: "); String po = sc.nextLine().trim();
+                    PaymentStrategy payment = "1".equals(po)
+                            ? new CreditCardPayment("holder", "1234567890124")
+                            : new UPIPayment("user@upi");
+                    Order order = orderSvc.placeOrder(customer, cart, addr, payment);
+                    System.out.println("Order placed: " + order.getId() + " Total: " + order.getTotal());
+                    executor.submit(() -> deliverySvc.startDelivery(order));
+                    cart.clear();
+                } else if ("5".equals(c)) {
+                    System.out.print("Pickup date (yyyy-mm-dd): "); String date = sc.nextLine().trim();
+                    System.out.print("Notes (optional): "); String notes = sc.nextLine().trim();
+                    PickupRequest pr = recyclingSvc.requestPickup(customer, date, notes);
+                    System.out.println("Pickup scheduled: " + pr.getId());
+                    executor.submit(() -> {
+                        try { recyclingSvc.processPickup(pr); }
+                        catch (Exception e) { System.out.println("Recycling failed: " + e.getMessage()); }
+                    });
+                } else if ("6".equals(c)) orderSvc.getOrdersForCustomer(customer.getId()).forEach(System.out::println);
+                else if ("7".equals(c)) recyclingSvc.getPickupsForCustomer(customer.getId()).forEach(System.out::println);
+                else if ("8".equals(c)) break;
+                else System.out.println("Invalid.");
+            } catch (Exception ex) { System.out.println("Error: " + ex.getMessage()); }
+        }
+    }
+
+    private static void seedData(FileRepository<User> userRepo, FileRepository<Product> productRepo) {
+        if (userRepo.isEmpty()) {
+            User admin = new User(UUID.randomUUID().toString(), "Admin", "admin@floracycle.com", "admin123", Role.ADMIN);
+            User alice = new Customer(UUID.randomUUID().toString(), "Alice", "alice@example.com", "alice123");
+            userRepo.save(admin); userRepo.save(alice);
+            System.out.println("Seeded users: admin@floracycle.com / admin123, alice@example.com / alice123");
+        }
+        if (productRepo.isEmpty()) {
+            List<Product> seeds = Arrays.asList(
+                    new Flower(UUID.randomUUID().toString(), "Red Roses Bouquet", "12 red roses", 799, 20, FlowerType.ROSE),
+                    new Flower(UUID.randomUUID().toString(), "Orchid Pack", "White orchids", 1200, 8, FlowerType.ORCHID)
+            );
+            seeds.forEach(productRepo::save);
+        }
+    }
+}
+package com.floracycle.model;
+
+import java.io.Serializable;
+import java.util.Objects;
+
+public class User implements Serializable {
+    private final String id;
+    private final String name;
+    private final String email;
+    private String password;
+    private final Role role;
+
+    public User(String id, String name, String email, String password, Role role) {
+        this.id = id; this.name = name; this.email = email.toLowerCase(); this.password = password; this.role = role;
+    }
+    public String getId() { return id; }
+    public String getName() { return name; }
+    public String getEmail() { return email; }
+    public Role getRole() { return role; }
+    public boolean checkPassword(String pwd) { return Objects.equals(password, pwd); }
+    @Override public String toString() { return name + " <" + email + "> (" + role + ")"; }
+}
+package com.floracycle.model;
+public class Customer extends User {
+    public Customer(String id, String name, String email, String password) {
+        super(id, name, email, password, Role.CUSTOMER);
+    }
+}
+package com.floracycle.model;
+public enum Role { ADMIN, CUSTOMER }
+package com.floracycle.model;
+import java.io.Serializable;
+public abstract class Product implements Serializable {
+    private final String id;
+    private String name;
+    private double price;
+    private int stock;
+    protected Product(String id, String name, double price, int stock) {
+        this.id = id; this.name = name; this.price = price; this.stock = stock;
+    }
+    public String getId() { return id; }
+    public String getName() { return name; }
+    public double getPrice() { return price; }
+    public synchronized int getStock() { return stock; }
+    public synchronized void setStock(int s) { this.stock = s; }
+    public synchronized void decreaseStock(int q) { this.stock = Math.max(0, this.stock - q); }
+    @Override public String toString() { return "[" + id + "] " + name + " - ₹" + price + " (" + stock + " avail)"; }
+}
+package com.floracycle.model;
+public class Flower extends Product {
+    private final FlowerType type;
+    public Flower(String id, String name, String descIgnored, double price, int stock, FlowerType type) {
+        super(id, name, price, stock); this.type = type;
+    }
+    public FlowerType getType() { return type; }
+    @Override public String toString() { return super.toString() + " [" + type + "]"; }
+}
+package com.floracycle.model;
+public enum FlowerType { ROSE, ORCHID, LILY, TULIP, MIXED }
+package com.floracycle.model;
+import java.io.Serializable;
+import java.util.*;
+public class Cart implements Serializable {
+    private final Map<String,Integer> items = new LinkedHashMap<>();
+    public void addItem(Product p, int qty) {
+        if (qty <= 0) throw new IllegalArgumentException("qty>0");
+        items.merge(p.getId(), qty, Integer::sum);
+    }
+    public void clear() { items.clear(); }
+    public boolean isEmpty() { return items.isEmpty(); }
+    public Map<String,Integer> getItems() { return Collections.unmodifiableMap(items); }
+    @Override public String toString() {
+        if (items.isEmpty()) return "Cart(empty)";
+        StringBuilder sb = new StringBuilder("Cart:\n");
+        items.forEach((k,v)-> sb.append(" - ").append(k).append(" : ").append(v).append("\n"));
+        return sb.toString();
+    }
+}
+package com.floracycle.model;
+import java.io.Serializable;
+import java.time.LocalDateTime;
+import java.util.*;
+public class Order implements Serializable {
+    private final String id;
+    private final String customerId;
+    private final Map<String,Integer> items;
+    private final double total;
+    private final String address;
+    private OrderStatus status;
+    private final LocalDateTime createdAt;
+    public Order(String id, String customerId, Map<String,Integer> items, double total, String address) {
+        this.id = id; this.customerId = customerId; this.items = new LinkedHashMap<>(items); this.total = total; this.address = address;
+        this.status = OrderStatus.PLACED; this.createdAt = LocalDateTime.now();
+    }
+    public String getId() { return id; }
+    public String getCustomerId() { return customerId; }
+    public Map<String,Integer> getItems() { return Collections.unmodifiableMap(items); }
+    public double getTotal() { return total; }
+    public String getAddress() { return address; }
+    public OrderStatus getStatus() { return status; }
+    public void setStatus(OrderStatus s) { this.status = s; }
+    @Override public String toString() {
+        return "Order[" + id + "] Total:₹" + total + " Status:" + status + " Items:" + items;
+    }
+}
+package com.floracycle.model;
+public enum OrderStatus { PLACED, CONFIRMED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED }
+package com.floracycle.model;
+import java.io.Serializable;
+import java.time.LocalDate;
+import java.util.UUID;
+
+public class PickupRequest implements Serializable {
+    private final String id;
+    private final String customerId;
+    private final LocalDate pickupDate;
+    private final String notes;
+    private PickupStatus status;
+
+    public PickupRequest(String customerId, LocalDate date, String notes) {
+        this.id = UUID.randomUUID().toString();
+        this.customerId = customerId;
+        this.pickupDate = date;
+        this.notes = notes;
+        this.status = PickupStatus.SCHEDULED;
+    }
+    public String getId() { return id; }
+    public String getCustomerId() { return customerId; }
+    public LocalDate getPickupDate() { return pickupDate; }
+    public String getNotes() { return notes; }
+    public PickupStatus getStatus() { return status; }
+    public void setStatus(PickupStatus s) { this.status = s; }
+    @Override public String toString() {
+        return "Pickup[" + id + "] date:" + pickupDate + " status:" + status + (notes.isBlank()? "" : " notes:" + notes);
+    }
+}
+package com.floracycle.model;
+public enum PickupStatus { SCHEDULED, COLLECTED, PROCESSED, FAILED }
+package com.floracycle.model;
+public class RecycledProduct extends Product {
+    private final String productType; // e.g., Agarbatti, Compost, Perfume
+    public RecycledProduct(String id, String name, double price, int stock, String productType) {
+        super(id, name, price, stock);
+        this.productType = productType;
+    }
+    public String getProductType() { return productType; }
+    @Override public String toString() { return super.toString() + " (Recycled: " + productType + ")"; }
+}
+package com.floracycle.payment;
+public interface PaymentStrategy {
+    boolean pay(double amount) throws Exception;
+    String getDetails();
+}
+package com.floracycle.payment;
+public class CreditCardPayment implements PaymentStrategy {
+    private final String holder;
+    private final String cardNumber;
+    public CreditCardPayment(String holder, String cardNumber) { this.holder = holder; this.cardNumber = cardNumber; }
+    @Override public boolean pay(double amount) throws Exception {
+        if (cardNumber == null || cardNumber.length() < 12) throw new RuntimeException("Invalid card");
+        // mock: accept if last digit even
+        char last = cardNumber.charAt(cardNumber.length()-1);
+        boolean ok = Character.isDigit(last) && ((last - '0') % 2 == 0);
+        if (!ok) throw new RuntimeException("Payment failed (mock)");
+        return true;
+    }
+    @Override public String getDetails() { return "Card(" + holder + ")"; }
+}
+package com.floracycle.payment;
+public class UPIPayment implements PaymentStrategy {
+    private final String upi;
+    public UPIPayment(String upi) { this.upi = upi; }
+    @Override public boolean pay(double amount) throws Exception {
+        if (upi == null || !upi.contains("@")) throw new RuntimeException("Invalid UPI");
+        if ((upi.length() % 2) != 0) throw new RuntimeException("UPI payment failed (mock)");
+        return true;
+    }
+    @Override public String getDetails() { return "UPI(" + upi + ")"; }
+}
+package com.floracycle.persistence;
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+public class FileRepository<T extends Serializable> {
+    private final String filePath;
+    private final Map<String,T> store = new ConcurrentHashMap<>();
+
+    public FileRepository(String filePath) { this.filePath = filePath; load(); }
+
+    @SuppressWarnings("unchecked")
+    private synchronized void load() {
+        File f = new File(filePath);
+        if (!f.exists()) return;
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(f))) {
+            Object obj = ois.readObject();
+            if (obj instanceof Map) {
+                Map<?,?> map = (Map<?,?>) obj;
+                map.forEach((k,v)-> store.put(String.valueOf(k),(T)v));
+            }
+        } catch (Exception e) { System.err.println("Load failed: " + e.getMessage()); }
+    }
+
+    private synchronized void saveToDisk() {
+        File parent = new File(filePath).getParentFile();
+        if (parent != null && !parent.exists()) parent.mkdirs();
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(filePath))) {
+            oos.writeObject(new HashMap<>(store));
+        } catch (Exception e) { System.err.println("Save failed: " + e.getMessage()); }
+    }
+
+    public synchronized void save(String id, T obj) { store.put(id, obj); saveToDisk(); }
+    public synchronized void save(T obj) {
+        try {
+            java.lang.reflect.Method m = obj.getClass().getMethod("getId");
+            String id = String.valueOf(m.invoke(obj));
+            save(id, obj);
+        } catch (Exception e) { throw new RuntimeException("Object has no getId()"); }
+    }
+    public Optional<T> findById(String id) { return Optional.ofNullable(store.get(id)); }
+    public List<T> findAll() { return new ArrayList<>(store.values()); }
+    public List<T> query(Predicate<T> p) { return store.values().stream().filter(p).collect(Collectors.toList()); }
+    public boolean isEmpty() { return store.isEmpty(); }
+}
+package com.floracycle.service;
+import com.floracycle.model.*;
+import com.floracycle.persistence.FileRepository;
+import java.util.List;
+import java.util.UUID;
+
+public class AuthService {
+    private final FileRepository<User> userRepo;
+    public AuthService(FileRepository<User> repo) { this.userRepo = repo; }
+
+    public User register(String name, String email, String pwd, Role role) {
+        if (name.isBlank() || email.isBlank() || pwd.isBlank()) throw new IllegalArgumentException("Fields required");
+        List<User> existing = userRepo.query(u -> u.getEmail().equalsIgnoreCase(email));
+        if (!existing.isEmpty()) throw new RuntimeException("Email exists");
+        User u = role==Role.CUSTOMER ? new Customer(UUID.randomUUID().toString(), name, email, pwd)
+                : new User(UUID.randomUUID().toString(), name, email, pwd, role);
+        userRepo.save(u);
+        return u;
+    }
+
+    public User login(String email, String pwd) {
+        return userRepo.query(u -> u.getEmail().equalsIgnoreCase(email))
+                .stream().filter(u -> u.checkPassword(pwd)).findFirst().orElseThrow(() -> new RuntimeException("Invalid credentials"));
+    }
+}
+package com.floracycle.service;
+import com.floracycle.model.*;
+import com.floracycle.persistence.FileRepository;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.stream.Collectors;
+
+public class CatalogService {
+    final FileRepository<Product> repo;
+    public CatalogService(FileRepository<Product> repo) { this.repo = repo; }
+    public List<Product> listProducts() { return repo.findAll(); }
+    public void addProduct(Product p) { repo.save(p); }
+    public Product getProductById(String id) { return repo.findById(id).orElseThrow(() -> new NoSuchElementException("Product not found")); }
+    public void updateStock(String id, int stock) { Product p = getProductById(id); p.setStock(stock); repo.save(p); }
+    public List<Product> search(String kw) { String k = kw.toLowerCase(); return repo.findAll().stream().filter(p->p.getName().toLowerCase().contains(k)).collect(Collectors.toList()); }
+}
+package com.floracycle.service;
+import com.floracycle.model.*;
+import com.floracycle.payment.PaymentStrategy;
+import com.floracycle.persistence.FileRepository;
+import java.util.*;
+
+public class OrderService {
+    private final FileRepository<Order> orderRepo;
+    private final FileRepository<Product> productRepo;
+    public OrderService(FileRepository<Order> or, FileRepository<Product> pr) { this.orderRepo = or; this.productRepo = pr; }
+
+    public Order placeOrder(Customer customer, Cart cart, String address, PaymentStrategy payment) throws Exception {
+        double total = 0.0;
+        Map<String,Integer> items = new LinkedHashMap<>();
+        for (var e : cart.getItems().entrySet()) {
+            String pid = e.getKey(); int qty = e.getValue();
+            Product p = productRepo.findById(pid).orElseThrow(() -> new RuntimeException("Product not found: " + pid));
+            if (p.getStock() < qty) throw new RuntimeException("Insufficient stock: " + p.getName());
+            total += p.getPrice() * qty; items.put(pid, qty);
+        }
+        boolean paid = payment.pay(total);
+        if (!paid) throw new RuntimeException("Payment failed");
+        for (var en : items.entrySet()) {
+            Product p = productRepo.findById(en.getKey()).get();
+            synchronized (p) {
+                p.decreaseStock(en.getValue());
+                productRepo.save(p);
+            }
+        }
+        Order order = new Order(UUID.randomUUID().toString(), customer.getId(), items, total, address);
+        orderRepo.save(order);
+        return order;
+    }
+
+    public List<Order> getOrdersForCustomer(String customerId) { return orderRepo.query(o -> o.getCustomerId().equals(customerId)); }
+    public void updateOrder(Order o) { orderRepo.save(o); }
+    public Optional<Order> findById(String id) { return orderRepo.findById(id); }
+}
+package com.floracycle.service;
+import com.floracycle.model.*;
+import java.util.Random;
+
+public class DeliveryService {
+    private final OrderService orderService;
+    private final Random rnd = new Random();
+    public DeliveryService(OrderService orderService) { this.orderService = orderService; }
+
+    public void startDelivery(Order order) {
+        try {
+            update(order, OrderStatus.CONFIRMED);
+            Thread.sleep(800 + rnd.nextInt(1200));
+            update(order, OrderStatus.OUT_FOR_DELIVERY);
+            Thread.sleep(800 + rnd.nextInt(1500));
+            update(order, OrderStatus.DELIVERED);
+            System.out.println("Order " + order.getId() + " delivered!");
+        } catch (InterruptedException e) {
+            update(order, OrderStatus.CANCELLED);
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void update(Order order, OrderStatus s) {
+        order.setStatus(s);
+        orderService.updateOrder(order);
+        System.out.println("Order " + order.getId() + " -> " + s);
+    }
+}
+package com.floracycle.service;
+import com.floracycle.model.*;
+import com.floracycle.persistence.FileRepository;
+
+import java.time.LocalDate;
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+
+public class RecyclingService {
+    private final FileRepository<PickupRequest> pickupRepo;
+    private final FileRepository<Product> productRepo;
+    private final OrderService orderService;
+
+    public RecyclingService(FileRepository<PickupRequest> pickupRepo, FileRepository<Product> productRepo, OrderService orderService) {
+        this.pickupRepo = pickupRepo; this.productRepo = productRepo; this.orderService = orderService;
+    }
+
+    public PickupRequest requestPickup(Customer customer, String dateIso, String notes) {
+        LocalDate date = LocalDate.parse(dateIso);
+        PickupRequest p = new PickupRequest(customer.getId(), date, notes == null ? "" : notes);
+        pickupRepo.save(p);
+        return p;
+    }
+
+    public List<PickupRequest> getPickupsForCustomer(String customerId) {
+        return pickupRepo.query(p -> p.getCustomerId().equals(customerId));
+    }
+
+    /**
+     * Simulates collection & processing. Produces recycled products and adds to inventory.
+     */
+    public void processPickup(PickupRequest pickup) {
+        try {
+            System.out.println("Processing pickup " + pickup.getId());
+            pickup.setStatus(PickupStatus.COLLECTED);
+            pickupRepo.save(pickup);
+            // simulate transport and processing time
+            Thread.sleep(1000 + ThreadLocalRandom.current().nextInt(2000));
+            // produce some recycled items (mock yields)
+            int agarbattiCount = 20 + ThreadLocalRandom.current().nextInt(21);
+            int compostKg = 2 + ThreadLocalRandom.current().nextInt(4);
+            int perfumes = 1 + ThreadLocalRandom.current().nextInt(3);
+
+            addOrIncreaseRecycled("agarbatti", "Agarbatti (Fragrant)", 49.0, agarbattiCount, "Agarbatti");
+            addOrIncreaseRecycled("compost", "Organic Compost (kg)", 29.0, compostKg, "Compost");
+            addOrIncreaseRecycled("perfume", "Natural Petal Perfume", 299.0, perfumes, "Perfume");
+
+            pickup.setStatus(PickupStatus.PROCESSED);
+            pickupRepo.save(pickup);
+            System.out.println("Pickup processed: " + pickup.getId() + " -> produced: " + agarbattiCount + " agarbatti, " + compostKg + " kg compost, " + perfumes + " perfumes.");
+        } catch (Exception e) {
+            pickup.setStatus(PickupStatus.FAILED);
+            pickupRepo.save(pickup);
+            System.out.println("Processing failed for pickup " + pickup.getId() + ": " + e.getMessage());
+        }
+    }
+
+    private void addOrIncreaseRecycled(String idHint, String name, double price, int addStock, String type) {
+        // search by name
+        List<Product> existing = productRepo.query(p -> p.getName().equalsIgnoreCase(name));
+        if (!existing.isEmpty()) {
+            Product p = existing.get(0);
+            synchronized (p) {
+                p.setStock(p.getStock() + addStock);
+                productRepo.save(p);
+            }
+        } else {
+            RecycledProduct rp = new RecycledProduct(UUID.randomUUID().toString(), name, price, addStock, type);
+            productRepo.save(rp);
+        }
+    }
+}
